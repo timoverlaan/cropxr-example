@@ -35,6 +35,8 @@ pandas = ">=2.2.3,<3"
 
 anndata = ">=0.11.4,<0.12"
 seaborn = ">=0.13.2,<0.14"
+umap-learn = ">=0.5.9.post2,<0.6"
+torchinfo = ">=1.8.0,<2"
 
 [target.linux-64.dependencies]
 scikit-misc = ">=0.1.4,<0.2"  # Apparently not available on windows
