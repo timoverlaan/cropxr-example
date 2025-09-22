@@ -60,7 +60,7 @@ All hyperparameters can be configured via command-line arguments. Run `pixi run 
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--epochs` | 1000 | Number of training epochs |
+| `--epochs` | 200 | Number of training epochs |
 | `--latent-dim` | 128 | Size of the learned representation |
 | `--hidden-dims` | 512 256 | Hidden layer sizes (encoder/decoder) |
 | `--batch-size` | 16 | Training batch size |
@@ -74,10 +74,7 @@ All hyperparameters can be configured via command-line arguments. Run `pixi run 
 # Quick test run
 python src/main.py --epochs 10 --n-splits 2
 
-# High-performance training
-python src/main.py --epochs 2000 --batch-size 64 --patience 20
-
-# Smaller model architecture  
+# Change model parameters
 python src/main.py --latent-dim 64 --hidden-dims 256 128 --dropout 0.2
 
 # Custom output directory

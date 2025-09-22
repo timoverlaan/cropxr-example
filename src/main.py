@@ -1,6 +1,7 @@
 import pickle as pkl
 import anndata as ad
 import pandas as pd
+import numpy as np
 import umap
 import argparse
 
@@ -14,7 +15,6 @@ import torch.nn.functional as F
 from torchinfo import summary
 from torch.utils.data import DataLoader, TensorDataset
 
-from sklearn.decomposition import PCA
 from sklearn.model_selection import KFold
 
 import matplotlib.pyplot as plt
@@ -32,10 +32,11 @@ def parse_args():
     )
     
     # Training hyperparameters
-    parser.add_argument('--epochs', type=int, default=1000, help='Number of training epochs')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
+    parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--min-delta', type=float, default=1e-4, help='Minimum improvement for early stopping')
     parser.add_argument('--batch-size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--inference-batch-size', type=int, default=128, help='Batch size for inference (UMAP generation)')
     parser.add_argument('--learning-rate', '--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=1e-5, help='Weight decay for optimizer')
     
@@ -175,8 +176,134 @@ class Autoencoder(nn.Module):
         return F.mse_loss(out, x)
 
 
+def load_and_prepare_data(args):
+    """Load and prepare TCGA data for training."""
+    print("Loading data...")
+    
+    # Load expression data
+    data = pkl.load(open(args.expression_data, "rb"))
+    data_pt = data[data["sample_type"] == "Primary Tumor"]
+    data_pt = data_pt.drop_duplicates(subset=["patient_id"])
+
+    # Load clinical metadata
+    metadata = pd.read_csv(args.clinical_data, index_col=0)
+
+    # Create AnnData object
+    adata = ad.AnnData(data_pt.set_index("patient_id").drop(columns=["sample_type"]))
+    adata.obs = metadata.loc[adata.obs_names].copy()
+    
+    print(f"Data loaded: {adata.n_obs} samples, {adata.n_vars} genes")
+    
+    return adata
 
 
+def train_fold(model, train_loader, val_loader, optimizer, criterion, args, device):
+    """Train a single fold and return the best validation loss and loss history."""
+    best_val = float('inf')
+    best_state = None
+    epochs_no_improve = 0
+    fold_loss_log = []
+
+    for epoch in trange(args.epochs, desc="Training"):
+        # Training phase
+        model.train()
+        for batch in train_loader:
+            x_batch = batch[0].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            x_recon, _ = model(x_batch)
+            loss = criterion(x_recon, x_batch)
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            optimizer.step()
+
+        # Validation phase
+        model.eval()
+        val_loss_sum = 0.0
+        n = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x_batch = batch[0].to(device, non_blocking=True)
+                x_recon, _ = model(x_batch)
+                loss = criterion(x_recon, x_batch)
+                bs = x_batch.size(0)
+                val_loss_sum += loss.item() * bs
+                n += bs
+        avg_val_loss = val_loss_sum / max(1, n)
+        fold_loss_log.append(avg_val_loss)
+
+        # Early stopping
+        if (best_val - avg_val_loss) > args.min_delta:
+            best_val = avg_val_loss
+            best_state = deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                break
+
+    return best_val, best_state, fold_loss_log
+
+
+def generate_embeddings(model, X_np, args, device):
+    """Generate embeddings in batches to avoid memory issues."""
+    model.eval()
+    batch_size = min(args.inference_batch_size, len(X_np))
+    embeddings = []
+    
+    with torch.no_grad():
+        for i in range(0, len(X_np), batch_size):
+            end_idx = min(i + batch_size, len(X_np))
+            X_batch = torch.tensor(X_np[i:end_idx], dtype=torch.float32, device=device)
+            batch_embeddings = model.encode(X_batch).cpu().numpy()
+            embeddings.append(batch_embeddings)
+            
+            # Clear GPU cache periodically
+            if torch.cuda.is_available() and i % (batch_size * 4) == 0:
+                torch.cuda.empty_cache()
+    
+    return np.vstack(embeddings)
+
+
+def create_plots(cv_loss_log, embeddings, adata, args):
+    """Create and save visualization plots."""
+    # Cross-validation loss plot
+    plt.figure(figsize=(10, 6))
+    for fold, val_loss in enumerate(cv_loss_log):
+        plt.plot(val_loss, label=f"Fold {fold+1}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Validation Loss")
+    plt.title("Cross-Validation Loss")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{args.output_dir}/cv_loss.png", bbox_inches='tight', dpi=300)
+    plt.close()
+
+    # UMAP plot
+    print("Computing UMAP...")
+    umap_embed = umap.UMAP(
+        n_components=2, 
+        min_dist=args.umap_min_dist, 
+        n_neighbors=args.umap_n_neighbors,
+        random_state=args.random_seed
+    )
+    X_umap_embed = umap_embed.fit_transform(embeddings)
+
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(
+        x=X_umap_embed[:, 0], 
+        y=X_umap_embed[:, 1], 
+        hue=adata.obs['tumor_tissue_site'], 
+        s=15, 
+        alpha=0.7
+    )
+    plt.title("UMAP of Learned Embeddings", fontsize=16)
+    plt.xlabel("UMAP 1", fontsize=14)
+    plt.ylabel("UMAP 2", fontsize=14)
+    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), title='Tumor Tissue Site')
+    plt.tight_layout()
+    plt.savefig(f"{args.output_dir}/umap_embeddings.png", bbox_inches='tight', dpi=300)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -217,122 +344,77 @@ if __name__ == "__main__":
     
     # Set random seed for reproducibility
     torch.manual_seed(args.random_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.random_seed)
     
-    data = pkl.load(open(args.expression_data, "rb"))
-    # structure:
-    # - index -> sample_id: str
-    # - patient_id: str
-    # - sample_type: str
-    # ... (one column per gene): float
-
-    data_pt = data[data["sample_type"] == "Primary Tumor"]
-    data_pt = data_pt.drop_duplicates(subset=["patient_id"])  # where there are still duplicate patient_ids, pick a random one
-
-
-    metadata = pd.read_csv(args.clinical_data, index_col=0)
-
-
-    adata = ad.AnnData(data_pt.set_index("patient_id").drop(columns=["sample_type"]))
-    adata.obs = metadata.loc[adata.obs_names].copy()
-    adata
-
-    model = Autoencoder(input_dim=adata.n_vars, latent_dim=args.latent_dim, hidden_dims=tuple(args.hidden_dims), dropout=args.dropout)
+    # Load and prepare data
+    adata = load_and_prepare_data(args)
+    
+    # Show model summary
+    model = Autoencoder(
+        input_dim=adata.n_vars, 
+        latent_dim=args.latent_dim, 
+        hidden_dims=tuple(args.hidden_dims), 
+        dropout=args.dropout
+    )
+    print("\nModel Architecture:")
     summary(model, input_size=(args.batch_size, adata.n_vars), device=torch.device("cpu"))
 
+    # Setup device and cross-validation
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print(f"\nUsing device: {device}")
 
     kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=args.random_seed)
     X_np = adata.X.astype('float32')
-
     cv_loss_log = []
 
+    # Cross-validation training
     for fold, (train_idx, val_idx) in enumerate(kf.split(X_np)):
-        print(f"Fold {fold+1}/{args.n_splits}")
+        print(f"\nFold {fold+1}/{args.n_splits}")
+        
+        # Prepare data loaders
         X_train = torch.tensor(X_np[train_idx], dtype=torch.float32)
         X_val = torch.tensor(X_np[val_idx], dtype=torch.float32)
         train_loader = DataLoader(TensorDataset(X_train), batch_size=args.batch_size, shuffle=True, drop_last=True)
         val_loader = DataLoader(TensorDataset(X_val), batch_size=args.batch_size, shuffle=False)
 
-        model = Autoencoder(input_dim=adata.n_vars, latent_dim=args.latent_dim, hidden_dims=tuple(args.hidden_dims), dropout=args.dropout)
-
+        # Initialize model for this fold
+        model = Autoencoder(
+            input_dim=adata.n_vars, 
+            latent_dim=args.latent_dim, 
+            hidden_dims=tuple(args.hidden_dims), 
+            dropout=args.dropout
+        )
         model = model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
         criterion = nn.MSELoss()
-        fold_loss_log = []
 
+        # Train this fold
+        best_val, best_state, fold_loss_log = train_fold(
+            model, train_loader, val_loader, optimizer, criterion, args, device
+        )
 
-        best_val = float('inf')
-        best_state = None
-        epochs_no_improve = 0
-        fold_loss_log = []
-
-        for epoch in trange(args.epochs):
-            # ---- Train ----
-            model.train()
-            for batch in train_loader:
-                x_batch = batch[0].to(device, non_blocking=True)
-                optimizer.zero_grad(set_to_none=True)
-                x_recon, _ = model(x_batch)
-                loss = criterion(x_recon, x_batch)
-                if not torch.isfinite(loss):
-                    continue
-                loss.backward()
-                optimizer.step()
-
-            # ---- Validate ----
-            model.eval()
-            val_loss_sum = 0.0
-            n = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    x_batch = batch[0].to(device, non_blocking=True)
-                    x_recon, _ = model(x_batch)
-                    loss = criterion(x_recon, x_batch)
-                    bs = x_batch.size(0)
-                    val_loss_sum += loss.item() * bs
-                    n += bs
-            avg_val_loss = val_loss_sum / max(1, n)
-            fold_loss_log.append(avg_val_loss)
-
-            # ---- Early stopping ----
-            if (best_val - avg_val_loss) > args.min_delta:
-                best_val = avg_val_loss
-                best_state = deepcopy(model.state_dict())
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= args.patience:
-                    break  # stop training
-
-        # ---- Restore best weights & record ----
+        # Restore best weights and record results
         if best_state is not None:
             model.load_state_dict(best_state)
 
         cv_loss_log.append(fold_loss_log)
-        print(f"  Best val loss: {best_val:.4f}")
+        print(f"  Best validation loss: {best_val:.4f}")
+        
+        # Clear GPU memory after each fold
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-
-    for fold, val_loss in enumerate(cv_loss_log):
-        plt.plot(val_loss, label=f"Fold {fold+1}")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Cross-Validation Loss")
-    plt.legend()
-    plt.savefig(f"{args.output_dir}/cv_loss.png", bbox_inches='tight', dpi=300)
-    plt.close()
-
-    # 2. UMAP on learned embeddings (encoder output)
-    model.eval()
-    with torch.no_grad():
-        X_tensor = torch.tensor(X_np, dtype=torch.float32, device=device)
-        embeddings = model.encode(X_tensor).cpu().numpy()
-    umap_embed = umap.UMAP(n_components=2, min_dist=args.umap_min_dist, n_neighbors=args.umap_n_neighbors)
-    X_umap_embed = umap_embed.fit_transform(embeddings)
-
-    sns.scatterplot(x=X_umap_embed[:, 0], y=X_umap_embed[:, 1], hue=adata.obs['tumor_tissue_site'], s=10, alpha=0.7)
-    plt.title("UMAP of Learned Embeddings")
-    plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), title='tumor_tissue_site')
-    plt.tight_layout()
-    plt.savefig(f"{args.output_dir}/umap_embeddings.png", bbox_inches='tight', dpi=300)
-    plt.close()
+    # Generate final embeddings and visualizations
+    print("\nGenerating final visualizations...")
+    embeddings = generate_embeddings(model, X_np, args, device)
+    create_plots(cv_loss_log, embeddings, adata, args)
+    
+    print(f"\n✅ Training completed successfully!")
+    print(f"📊 Results saved to {args.output_dir}/:")
+    print(f"   - cv_loss.png (cross-validation curves)")
+    print(f"   - umap_embeddings.png (tumor visualization)")
+    
+    # Final cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
