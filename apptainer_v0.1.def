@@ -1,0 +1,23 @@
+# Version: 0.1.1
+
+# Header
+Bootstrap: docker
+From: ghcr.io/prefix-dev/pixi:0.34.0
+
+# Files
+%files
+    pixi.toml /opt/app/pixi.toml
+    pixi.lock /opt/app/pixi.lock
+
+# Install dependencies
+%post
+    apt update
+    apt install -y git strace
+
+    cd /opt/app
+
+    # Setup pixi dependencies
+    pixi install -e cuda
+
+    # Clean up
+    rm -rf ~/.cache/rattler
