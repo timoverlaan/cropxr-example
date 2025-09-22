@@ -31,6 +31,22 @@ wheels/
 *.swo
 *~
 
-
 # Data
 data/
+
+# Output files
+*.png
+*.jpg
+*.pdf
+results/
+demo_output/
+models/
+checkpoints/
+
+# Jupyter notebooks
+*.ipynb_checkpoints/
+.ipynb_checkpoints
+
+# OS files
+.DS_Store
+Thumbs.db

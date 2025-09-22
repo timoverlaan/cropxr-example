@@ -12,8 +12,8 @@ The Cancer Genome Atlas (TCGA) is a landmark cancer genomics program that molecu
 
 This rich dataset enables researchers to discover molecular subtypes, identify biomarkers, and understand cancer biology at unprecedented scale.
 
-This script uses only the gene expression and clinical data.
-
+TCGA is publically available. We use the processed output data of another repository: https://github.com/brmprnk/LB2292/tree/main/project2/data. For questions about the data, or to request a copy of the processed data, please contact t.verlaan@tudelft.nl ;
+This script uses only the gene expression and clinical data. 
 ## What This Script Does
 
 The main script (`src/main.py`) implements a deep learning pipeline that:
@@ -93,7 +93,7 @@ The script generates:
 ## Data Structure
 
 Expected data files in `data/` directory:
-- **`expression.pkl`** - Gene expression matrix (samples × genes)
+- **`expression.pkl`** - Gene expression matrix (samples × genes)  
 - **`clinical.csv`** - Clinical metadata with tumor tissue site annotations
 
 ## Requirements
